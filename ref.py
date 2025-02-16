@@ -45,13 +45,14 @@ class ProxyManager:
             self.active_proxies.add(proxy)
             return proxy
 
-    def release_proxy(self, proxy: str):
-        """Release a proxy back to the available pool"""
+    def release_proxy(self, proxy: str, delay: int = 0.5):
+        """Release a proxy back to the pool after a delay"""
         with self.lock:
             if proxy in self.active_proxies:
                 self.active_proxies.remove(proxy)
+                logger.debug(f"Proxy {proxy} will be available again after {delay} seconds")
+                time.sleep(delay)  # Prevents immediate reuse
                 self.available_proxies.put(proxy)
-                logger.debug(f"Released proxy: {proxy}")
 
 class LayerEdgeRegistration:
     def __init__(self, max_workers: int = 10):
@@ -190,80 +191,103 @@ class LayerEdgeRegistration:
         ]
         return any(err in error_str for err in proxy_errors)
 
+    def remove_wallet_from_file(self, wallet_address: str, filename: str = "address.txt"):
+        """Remove a successfully registered wallet from address.txt"""
+        try:
+            with self.stats_lock:
+                with open(filename, "r") as file:
+                    lines = file.readlines()
+                with open(filename, "w") as file:
+                    for line in lines:
+                        if line.strip() != wallet_address:
+                            file.write(line)
+                logger.info(f"Removed registered wallet: {wallet_address} from {filename}")
+        except Exception as e:
+          logger.error(f"Error removing wallet {wallet_address} from {filename}: {str(e)}")
+      
     def process_wallet(self, address: str, ref_codes: List[str], proxy_manager: ProxyManager) -> None:
-        """Process a single wallet with unique proxy"""
+        """Process a single wallet with a unique proxy"""
         max_retries = 3
         retry_count = 0
         used_proxies = set()
         success = False
-
+    
         while retry_count < max_retries and not success:
             proxy = proxy_manager.get_proxy()
+            
+            # Ensure we don't reuse the same failing proxy
             while proxy in used_proxies:
                 proxy_manager.release_proxy(proxy)
                 proxy = proxy_manager.get_proxy()
-            
+    
             used_proxies.add(proxy)
+    
             try:
                 formatted_proxy = self.format_proxy(proxy)
                 invite_code = random.choice(ref_codes)
-
+    
                 scraper = cloudscraper.create_scraper()
                 scraper.proxies = formatted_proxy
-
+    
                 if retry_count == 0:
                     logger.info(f"Processing wallet: {address}")
                 else:
                     logger.info(f"Retrying wallet: {address} (Attempt {retry_count + 1})")
-                
+    
                 logger.debug(f"Using proxy: {formatted_proxy['http']}")
                 logger.debug(f"Using invite code: {invite_code}")
-
+    
+                # Verify referral code before proceeding
                 verify_result = self.verify_referral(scraper, invite_code)
-
+    
                 if not verify_result:
                     logger.warning(f"Verify failed for invite code: {invite_code}")
-                
+    
                 if self.register_wallet(scraper, invite_code, address):
                     success = True
                     logger.success(f"Successfully registered wallet {address}")
+    
+                    # Remove wallet from file after successful registration
+                    self.remove_wallet_from_file(address)
+    
                     break
                 else:
                     logger.error(f"Failed to register wallet {address}")
-
+    
             except Exception as e:
                 proxy_manager.release_proxy(proxy)
-                
+    
                 if self.is_proxy_error(e):
                     retry_count += 1
                     if retry_count < max_retries:
-                        logger.warning(f"Proxy error for {address}, retrying with new proxy... ({retry_count}/{max_retries})")
+                        logger.warning(f"Proxy error for {address}, switching to a new proxy... ({retry_count}/{max_retries})")
                         time.sleep(random.uniform(1, 2))
-                        continue
+                        continue  # Immediately retry with a new proxy
                     else:
                         logger.error(f"Max retries reached for wallet {address}")
                 else:
                     logger.error(f"Non-proxy error for wallet {address}: {str(e)}")
                     break
-
+    
             finally:
                 proxy_manager.release_proxy(proxy)
                 time.sleep(random.uniform(0.5, 1.5))
-
+    
         self.update_stats(success)
-
+  
+  
     def process_all_wallets(self, addresses: List[str], ref_codes: List[str], proxy_manager: ProxyManager):
-        """Process all wallets using ThreadPoolExecutor"""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [
-                executor.submit(self.process_wallet, address, ref_codes, proxy_manager)
-                for address in addresses if address
-                ]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Thread error: {str(e)}")
+          """Process all wallets using ThreadPoolExecutor"""
+          with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+              futures = [
+                  executor.submit(self.process_wallet, address, ref_codes, proxy_manager)
+                  for address in addresses if address
+                  ]
+              for future in concurrent.futures.as_completed(futures):
+                  try:
+                      future.result()
+                  except Exception as e:
+                      logger.error(f"Thread error: {str(e)}")
 
     def print_stats(self):
         """Print registration statistics"""

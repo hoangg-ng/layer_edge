@@ -3,3 +3,7 @@ package-lock.json
 __pycache__/
 venv/
 .vscode/
+address.txt
+proxy.txt
+privatekey.txt
+layeredge.csv
